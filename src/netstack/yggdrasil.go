@@ -1,8 +1,10 @@
 package netstack
 
 import (
+	"container/list"
 	"log"
 	"net"
+	"sync"
 
 	"github.com/yggdrasil-network/yggdrasil-go/src/core"
 	"github.com/yggdrasil-network/yggdrasil-go/src/ipv6rwc"
@@ -12,6 +14,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
 type YggdrasilNIC struct {
@@ -20,15 +23,18 @@ type YggdrasilNIC struct {
 	dispatcher stack.NetworkDispatcher
 	readBuf    []byte
 	writeBuf   []byte
+	rstPacketMutex sync.Mutex
+	rstPackets *list.List
 }
 
 func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 	rwc := ipv6rwc.NewReadWriteCloser(ygg)
 	mtu := rwc.MTU()
 	nic := &YggdrasilNIC{
-		ipv6rwc:  rwc,
-		readBuf:  make([]byte, mtu),
-		writeBuf: make([]byte, mtu),
+		ipv6rwc:    rwc,
+		readBuf:    make([]byte, mtu),
+		writeBuf:   make([]byte, mtu),
+		rstPackets: list.New(),
 	}
 	if err := s.stack.CreateNIC(1, nic); err != nil {
 		return err
@@ -46,6 +52,23 @@ func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
 				Payload: buffer.MakeWithData(nic.readBuf[:rx]),
 			})
 			nic.dispatcher.DeliverNetworkPacket(ipv6.ProtocolNumber, pkb)
+		}
+	}()
+	go func() {
+		for {
+			for rstPkt := nic.rstPackets.Front(); rstPkt != nil; rstPkt = rstPkt.Next() {
+				nic.rstPacketMutex.Lock()
+				val := nic.rstPackets.Remove(rstPkt)
+				nic.rstPacketMutex.Unlock()
+				if val == nil {
+					continue
+				}
+				pkt, ok := val.(*stack.PacketBuffer)
+				if !ok {
+					continue
+				}
+				_ = nic.writePacket(pkt)
+			}
 		}
 	}()
 	_, snet, err := net.ParseCIDR("0200::/7")
@@ -93,21 +116,50 @@ func (*YggdrasilNIC) LinkAddress() tcpip.LinkAddress { return "" }
 
 func (*YggdrasilNIC) Wait() {}
 
+func (e *YggdrasilNIC) writePacket(
+	pkt *stack.PacketBuffer,
+) tcpip.Error {
+	// We need to recover from panic() here because
+	// parser in ToView() gets confused on some packets
+	// without payload and panics
+	defer func() {
+		r := recover()
+		if r != nil {
+		}
+	}()
+	vv := pkt.ToView()
+	n, err := vv.Read(e.writeBuf)
+	if err != nil {
+		return &tcpip.ErrAborted{}
+	}
+	_, err = e.ipv6rwc.Write(e.writeBuf[:n])
+	if err != nil {
+		return &tcpip.ErrAborted{}
+	}
+	return nil
+}
+
 func (e *YggdrasilNIC) WritePackets(
 	list stack.PacketBufferList,
 ) (int, tcpip.Error) {
 	var i int = 0
+	var err tcpip.Error = nil
 	for i, pkt := range list.AsSlice() {
-		vv := pkt.ToView()
-		n, err := vv.Read(e.writeBuf)
-		if err != nil {
-			log.Println(err)
-			return i - 1, &tcpip.ErrAborted{}
+		if pkt.Data().Size() == 0 {
+			if pkt.Network().TransportProtocol() == tcp.ProtocolNumber {
+				tcpHeader := header.TCP(pkt.TransportHeader().Slice())
+				if (tcpHeader.Flags() & header.TCPFlagRst) == header.TCPFlagRst {
+					e.rstPacketMutex.Lock()
+					e.rstPackets.PushBack(pkt)
+					e.rstPacketMutex.Unlock()
+					continue
+				}
+			}
 		}
-		_, err = e.ipv6rwc.Write(e.writeBuf[:n])
+		err = e.writePacket(pkt)
 		if err != nil {
 			log.Println(err)
-			return i - 1, &tcpip.ErrAborted{}
+			return i - 1, err
 		}
 	}
 
