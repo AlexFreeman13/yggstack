@@ -18,13 +18,13 @@ import (
 )
 
 type YggdrasilNIC struct {
-	stack      *YggdrasilNetstack
-	ipv6rwc    *ipv6rwc.ReadWriteCloser
-	dispatcher stack.NetworkDispatcher
-	readBuf    []byte
-	writeBuf   []byte
+	stack          *YggdrasilNetstack
+	ipv6rwc        *ipv6rwc.ReadWriteCloser
+	dispatcher     stack.NetworkDispatcher
+	readBuf        []byte
+	writeBuf       []byte
 	rstPacketMutex sync.Mutex
-	rstPackets *list.List
+	rstPackets     *list.List
 }
 
 func (s *YggdrasilNetstack) NewYggdrasilNIC(ygg *core.Core) tcpip.Error {
